@@ -23,7 +23,9 @@ logger = logging.getLogger("protontricks")
 
 class SteamApp(object):
     """
-    SteamApp represents an installed Steam app
+    SteamApp represents an installed Steam app or whatever is close enough to
+    one (eg. a custom Proton installation or a Windows shortcut with its own
+    Proton prefix)
     """
     __slots__ = ("appid", "name", "prefix_path", "install_path")
 
@@ -415,6 +417,97 @@ def get_custom_proton_installations(steam_path):
     return custom_proton_apps
 
 
+def find_current_steamid3(steam_path):
+    def to_steamid3(steamid64):
+        """Convert a SteamID64 into the SteamID3 format"""
+        return int(steamid64) & 0xffffffff
+
+    loginusers_path = os.path.join(steam_path, "config", "loginusers.vdf")
+    try:
+        with open(loginusers_path, "r") as f:
+            content = f.read()
+            vdf_data = vdf.loads(content)
+    except IOError:
+        return None
+
+    users = [
+        {
+            "steamid3": to_steamid3(user_id),
+            "account_name": user_data["AccountName"],
+            "timestamp": user_data.get("Timestamp", 0)
+        }
+        for user_id, user_data in vdf_data["users"].items()
+    ]
+
+    # Return the user with the highest timestamp, as that's likely to be the
+    # currently logged-in user
+    if len(users) > 0:
+        user = max(users, key=lambda u: u["timestamp"])
+        logger.info(
+            "Currently logged-in Steam user: %s", user["account_name"]
+        )
+        return user["steamid3"]
+
+    return None
+
+
+def get_custom_windows_shortcuts(steam_path):
+    """
+    Get a list of custom shortcuts for Windows applications as a list
+    of SteamApp objects
+    """
+    # Get the Steam ID3 for the currently logged-in user
+    steamid3 = find_current_steamid3(steam_path)
+
+    shortcuts_path = os.path.join(
+        steam_path, "userdata", str(steamid3), "config", "shortcuts.vdf"
+    )
+
+    try:
+        with open(shortcuts_path, "rb") as f:
+            content = f.read()
+            vdf_data = vdf.binary_loads(content)
+    except IOError:
+        logger.info(
+            "Couldn't find custom shortcuts. Maybe none have been created yet?"
+        )
+        return []
+
+    steam_apps = []
+
+    for shortcut_id, shortcut_data in vdf_data["shortcuts"].items():
+        shortcut_id = int(shortcut_id)
+
+        # The "pseudo App ID" for custom shortcuts seems to be:
+        # 2147483651 + shortcut ID
+        # FIXME: This assumption isn't entirely correct. At least
+        # one created shortcut has the pseudo App ID 2147483652
+        # while according to the above formula it should have the App ID
+        # 2147483654.
+        appid = 2147483651 + int(shortcut_id)
+
+        prefix_path = os.path.join(
+            steam_path, "steamapps", "compatdata", str(appid), "pfx"
+        )
+        install_path = shortcut_data["StartDir"]
+
+        if not os.path.isdir(prefix_path):
+            continue
+
+        steam_apps.append(
+            SteamApp(
+                appid=appid, name=shortcut_data["AppName"],
+                prefix_path=prefix_path, install_path=install_path
+            )
+        )
+
+    logger.info(
+        "Found %d Steam shortcuts running under Proton", len(steam_apps)
+    )
+
+    return steam_apps
+
+
 def get_steam_apps(steam_path, steam_lib_dirs):
     """
     Find all the installed Steam apps and return them as a list of SteamApp
@@ -437,8 +530,9 @@ def get_steam_apps(steam_path, steam_lib_dirs):
             if steam_app:
                 steam_apps.append(steam_app)
 
-    # Get the custom Proton installations as well
+    # Get the custom Proton installations and non-Steam shortcuts as well
     steam_apps += get_custom_proton_installations(steam_path=steam_path)
+    steam_apps += get_custom_windows_shortcuts(steam_path=steam_path)
 
     # Sort the apps by their names
     steam_apps.sort(key=lambda app: app.name)
